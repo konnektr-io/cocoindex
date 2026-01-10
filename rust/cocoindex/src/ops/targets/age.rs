@@ -7,6 +7,7 @@ use crate::setup::{ResourceSetupChange, SetupChangeType};
 use crate::{ops::sdk::*, setup::CombinedState};
 use crate::settings::DatabaseConnectionSpec;
 
+use crate::ops::shared::postgres::get_db_pool;
 use sqlx::PgPool;
 use std::fmt::Write;
 use std::collections::HashMap;
@@ -208,6 +209,25 @@ impl IndexDef {
     }
 }
 
+async fn try_load_age(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<()> {
+    sqlx::query("SAVEPOINT load_age_savepoint").execute(&mut **tx).await?;
+    if let Err(e) = sqlx::query("LOAD 'age'").execute(&mut **tx).await {
+        tracing::debug!("Failed to LOAD 'age': {}. Trying fallback path...", e);
+        sqlx::query("ROLLBACK TO SAVEPOINT load_age_savepoint").execute(&mut **tx).await?;
+        
+        sqlx::query("SAVEPOINT load_age_plugins_savepoint").execute(&mut **tx).await?;
+        if let Err(e2) = sqlx::query("LOAD '$libdir/plugins/age'").execute(&mut **tx).await {
+             tracing::warn!("Failed to LOAD '$libdir/plugins/age': {}. Proceeding assuming it's preloaded.", e2);
+             sqlx::query("ROLLBACK TO SAVEPOINT load_age_plugins_savepoint").execute(&mut **tx).await?;
+        } else {
+             sqlx::query("RELEASE SAVEPOINT load_age_plugins_savepoint").execute(&mut **tx).await?;
+        }
+    } else {
+        sqlx::query("RELEASE SAVEPOINT load_age_savepoint").execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct SetupComponentOperator {
     pool: PgPool,
@@ -217,7 +237,7 @@ struct SetupComponentOperator {
 
 impl SetupComponentOperator {
     async fn get_graph_oid(&self, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<u32> {
-        let oid: i32 = sqlx::query_scalar("SELECT graphid FROM ag_catalog.ag_graph WHERE name = $1")
+        let oid: i32 = sqlx::query_scalar("SELECT graphid::int FROM ag_catalog.ag_graph WHERE name::text = $1::text")
             .bind(&self.graph_name)
             .fetch_one(&mut **tx)
             .await?;
@@ -231,23 +251,26 @@ impl SetupComponentOperator {
         is_edge: bool
     ) -> Result<()> {
         let graph = &self.graph_name;
-        // Check if label exists
-        let exists: bool = sqlx::query_scalar(
-            "SELECT count(*) > 0 FROM ag_catalog.ag_label WHERE name = $1 AND graph = (SELECT graphid FROM ag_catalog.ag_graph WHERE name = $2)"
-        )
-        .bind(label)
-        .bind(graph)
-        .fetch_one(&mut **tx)
-        .await?;
+        
+        let create_q = if is_edge {
+             format!("SELECT create_elabel('{}', '{}')", graph, label)
+         } else {
+             format!("SELECT create_vlabel('{}', '{}')", graph, label)
+         };
 
-        if !exists {
-             let create_q = if is_edge {
-                 format!("SELECT create_elabel('{}', '{}')", graph, label)
+         sqlx::query("SAVEPOINT create_label_savepoint").execute(&mut **tx).await?;
+         
+         if let Err(e) = sqlx::query(&create_q).execute(&mut **tx).await {
+             let msg = e.to_string();
+             if msg.contains("already exists") {
+                 sqlx::query("ROLLBACK TO SAVEPOINT create_label_savepoint").execute(&mut **tx).await?;
              } else {
-                 format!("SELECT create_vlabel('{}', '{}')", graph, label)
-             };
-             sqlx::query(&create_q).execute(&mut **tx).await?;
-        }
+                 sqlx::query("ROLLBACK TO SAVEPOINT create_label_savepoint").execute(&mut **tx).await?;
+                 return Err(e.into());
+             }
+         } else {
+             sqlx::query("RELEASE SAVEPOINT create_label_savepoint").execute(&mut **tx).await?;
+         }
         Ok(())
     }
 }
@@ -297,7 +320,7 @@ impl components::SetupOperator for SetupComponentOperator {
          }
 
          let mut tx = self.pool.begin().await?;
-         sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
+         try_load_age(&mut tx).await?;
          sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
 
          let graph = &self.graph_name;
@@ -316,10 +339,11 @@ impl components::SetupOperator for SetupComponentOperator {
              IndexDef::KeyConstraint { field_names } => {
                  let exprs = field_names
                     .iter()
-                    .map(|f| format!("(properties ->> '{}')", f))
+                    .map(|f| format!("(ag_catalog.agtype_access_operator(properties, '\"{}\"'::ag_catalog.agtype)::text)", f))
                     .collect::<Vec<_>>()
                     .join(", ");
                  let sql = format!("CREATE UNIQUE INDEX {} ON {}.{} ({})", q_index, q_graph, q_label, exprs);
+                 tracing::debug!("Executing AGE SQL: {}", sql);
                  sqlx::query(&sql).execute(&mut *tx).await?;
              }
              IndexDef::VectorIndex { field_name, metric, method, vector_size } => {
@@ -394,12 +418,12 @@ impl AgeSetupChange {
     async fn apply_change(&self) -> Result<()> {
         if let Some(action) = &self.label_to_clean {
             let mut tx = self.pool.begin().await?;
-            sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
+            try_load_age(&mut tx).await?;
             sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
 
             let graph = &self.graph_name;
             let cypher = format!("MATCH (n:{}) DETACH DELETE n", action.label);
-            let sql = format!("SELECT * FROM cypher('{}', $$ {} $$) as (v agtype)", graph, cypher);
+            let sql = format!("SELECT * FROM cypher('{}'::name, $$ {} $$) as (v agtype)", graph, cypher);
             
             if let Err(e) = sqlx::query(&sql).execute(&mut *tx).await {
                 tracing::warn!("Failed to clear data for label {}: {}", action.label, e);
@@ -445,10 +469,7 @@ async fn get_connection_pool(
     conn_ref: &spec::AuthEntryReference<DatabaseConnectionSpec>,
     auth_registry: &AuthRegistry
 ) -> Result<PgPool> {
-    let conn_spec = auth_registry.get(conn_ref)?;
-    // DatabaseConnectionSpec is compatible with get_pool, no need for conversion
-    let lib_context = get_lib_context().await?;
-    lib_context.db_pools.get_pool(&conn_spec).await
+    get_db_pool(Some(conn_ref), auth_registry).await
 }
 
 async fn check_pgvector(pool: &PgPool) -> Result<bool> {
@@ -490,8 +511,120 @@ fn generate_cypher_upsert(coll: &AnalyzedDataCollection, has_pgvector: bool) -> 
                 write!(q, "{}", sets).unwrap();
             }
         }
-        ElementType::Relationship(_) => {
-             api_bail!("Relationship support not fully implemented for AGE target yet");
+        ElementType::Relationship(label) => {
+            let rel_mapping = coll
+                .rel
+                .as_ref()
+                .ok_or_else(|| api_error!("Missing relationship mapping"))?;
+
+            // Source node
+            let src_label = rel_mapping.source.schema.elem_type.label();
+            let src_key_match = rel_mapping
+                .source
+                .schema
+                .key_fields
+                .iter()
+                .map(|f| format!("{}: row.__source.{}", f.name, f.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            write!(q, "MERGE (start:{} {{ {} }}) ", src_label, src_key_match).unwrap();
+
+            if !rel_mapping.source.schema.value_fields.is_empty() {
+                write!(q, "SET ").unwrap();
+                let sets = rel_mapping
+                    .source
+                    .schema
+                    .value_fields
+                    .iter()
+                    .map(|f| {
+                        let is_vec = matches!(
+                            f.value_type.typ,
+                            schema::ValueType::Basic(schema::BasicValueType::Vector(_))
+                        );
+                        if is_vec && has_pgvector {
+                            format!("start.{} = row.__source.{}::vector", f.name, f.name)
+                        } else {
+                            format!("start.{} = row.__source.{}", f.name, f.name)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(q, "{} ", sets).unwrap();
+            }
+
+            // Target node
+            let tgt_label = rel_mapping.target.schema.elem_type.label();
+            let tgt_key_match = rel_mapping
+                .target
+                .schema
+                .key_fields
+                .iter()
+                .map(|f| format!("{}: row.__target.{}", f.name, f.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            write!(q, "MERGE (end:{} {{ {} }}) ", tgt_label, tgt_key_match).unwrap();
+
+            if !rel_mapping.target.schema.value_fields.is_empty() {
+                write!(q, "SET ").unwrap();
+                let sets = rel_mapping
+                    .target
+                    .schema
+                    .value_fields
+                    .iter()
+                    .map(|f| {
+                        let is_vec = matches!(
+                            f.value_type.typ,
+                            schema::ValueType::Basic(schema::BasicValueType::Vector(_))
+                        );
+                        if is_vec && has_pgvector {
+                            format!("end.{} = row.__target.{}::vector", f.name, f.name)
+                        } else {
+                            format!("end.{} = row.__target.{}", f.name, f.name)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(q, "{} ", sets).unwrap();
+            }
+
+            // Relationship
+            let rel_key_match = coll
+                .schema
+                .key_fields
+                .iter()
+                .map(|f| format!("{}: row.{}", f.name, f.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            write!(
+                q,
+                "MERGE (start)-[r:{} {{ {} }}]->(end) ",
+                label, rel_key_match
+            )
+            .unwrap();
+
+            if !coll.schema.value_fields.is_empty() {
+                write!(q, "SET ").unwrap();
+                let sets = coll
+                    .schema
+                    .value_fields
+                    .iter()
+                    .map(|f| {
+                        let is_vec = matches!(
+                            f.value_type.typ,
+                            schema::ValueType::Basic(schema::BasicValueType::Vector(_))
+                        );
+                        if is_vec && has_pgvector {
+                            format!("r.{} = row.{}::vector", f.name, f.name)
+                        } else {
+                            format!("r.{} = row.{}", f.name, f.name)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(q, "{}", sets).unwrap();
+            }
         }
     }
     Ok(q)
@@ -507,7 +640,21 @@ fn generate_cypher_delete(coll: &AnalyzedDataCollection) -> Result<String> {
                 .collect::<Vec<_>>().join(", ");
             write!(q, "MATCH (n:{} {{ {} }}) DETACH DELETE n", label, key_props_match).unwrap();
         }
-        _ => { api_bail!("Relationship delete not implemented"); }
+        ElementType::Relationship(label) => {
+            let key_props_match = coll
+                .schema
+                .key_fields
+                .iter()
+                .map(|f| format!("{}: row.{}", f.name, f.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            write!(
+                q,
+                "MATCH ()-[r:{} {{ {} }}]->() DELETE r",
+                label, key_props_match
+            )
+            .unwrap();
+        }
     }
     Ok(q)
 }
@@ -679,7 +826,7 @@ impl TargetFactoryBase for Factory {
                  visited_graphs.insert(key.clone());
                  
                  let mut tx = sc.pool.begin().await?;
-                 sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
+                 try_load_age(&mut tx).await?;
                  sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
                  
                  let exists: bool = sqlx::query_scalar("SELECT count(*) > 0 FROM ag_graph WHERE name = $1")
@@ -719,18 +866,28 @@ impl ExportContext {
     async fn upsert(&self, upserts: &[ExportTargetUpsertEntry]) -> Result<()> {
         if upserts.is_empty() { return Ok(()); } 
         let mut tx = self.pool.begin().await?;
-        sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
+        try_load_age(&mut tx).await?;
         sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
+
+        // Use PREPARE to handle agtype parameter correctly
+        let stmt_name = format!("age_upsert_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        
+        let prepare_sql = format!(
+            "PREPARE {} (ag_catalog.agtype) AS SELECT * FROM cypher('{}'::name, $$ UNWIND $batch AS row {} $$::text, $1) as (v ag_catalog.agtype)", 
+            stmt_name,
+            self.graph_name, 
+            self.upsert_cypher
+        );
+        sqlx::query(&prepare_sql).execute(&mut *tx).await?;
 
         // Convert to JSON
         let items_json = self.prepare_json(upserts, true)?;
         
-        let sql = format!(
-            "SELECT * FROM cypher('{}', $$ UNWIND $batch AS row {} $$, $1::agtype) as (v agtype)", 
-            self.graph_name, 
-            self.upsert_cypher
-        );
-        sqlx::query(&sql).bind(items_json).execute(&mut *tx).await?;
+        let exec_sql = format!("EXECUTE {} ($1)", stmt_name);
+        sqlx::query(&exec_sql).bind(items_json).execute(&mut *tx).await?;
+        
+        sqlx::query(&format!("DEALLOCATE {}", stmt_name)).execute(&mut *tx).await?;
+
         tx.commit().await?;
         Ok(())
     }
@@ -738,14 +895,14 @@ impl ExportContext {
     async fn delete(&self, deletes: &[ExportTargetDeleteEntry]) -> Result<()> {
         if deletes.is_empty() { return Ok(()); } 
         let mut tx = self.pool.begin().await?;
-        sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
+        try_load_age(&mut tx).await?;
         sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
 
         // Convert to JSON
         let items_json = self.prepare_json_delete(deletes)?;
 
         let sql = format!(
-            "SELECT * FROM cypher('{}', $$ UNWIND $batch AS row {} $$, $1::agtype) as (v agtype)", 
+            "SELECT * FROM cypher('{}'::name, $$ UNWIND $batch AS row {} $$, $1::agtype) as (v agtype)", 
             self.graph_name, 
             self.delete_cypher
         );
@@ -754,17 +911,62 @@ impl ExportContext {
         Ok(())
     }
 
-    fn prepare_json(&self, items: &[ExportTargetUpsertEntry], include_values: bool) -> Result<String> {
+    fn prepare_json(
+        &self,
+        items: &[ExportTargetUpsertEntry],
+        include_values: bool,
+    ) -> Result<String> {
         let mut rows = Vec::with_capacity(items.len());
         for item in items {
             let mut row_map = serde_json::Map::new();
             self.fill_key(&mut row_map, &item.key)?;
+
             if include_values {
-                for (i, val) in item.value.fields.iter().enumerate() {
-                    if i < self.analyzed_data_coll.schema.value_fields.len() {
-                        let field = &self.analyzed_data_coll.schema.value_fields[i];
-                        row_map.insert(field.name.clone(), serde_json::to_value(val)?);
+                for (schema_idx, &val_idx) in self
+                    .analyzed_data_coll
+                    .value_fields_input_idx
+                    .iter()
+                    .enumerate()
+                {
+                    let field = &self.analyzed_data_coll.schema.value_fields[schema_idx];
+                    let val = &item.value.fields[val_idx];
+                    row_map.insert(field.name.clone(), serde_json::to_value(val)?);
+                }
+
+                if let Some(rel_mapping) = &self.analyzed_data_coll.rel {
+                    let mut src_map = serde_json::Map::new();
+                    for (schema_idx, &val_idx) in
+                        rel_mapping.source.fields_input_idx.key.iter().enumerate()
+                    {
+                        let field = &rel_mapping.source.schema.key_fields[schema_idx];
+                        let val = &item.value.fields[val_idx];
+                        src_map.insert(field.name.clone(), serde_json::to_value(val)?);
                     }
+                    for (schema_idx, &val_idx) in
+                        rel_mapping.source.fields_input_idx.value.iter().enumerate()
+                    {
+                        let field = &rel_mapping.source.schema.value_fields[schema_idx];
+                        let val = &item.value.fields[val_idx];
+                        src_map.insert(field.name.clone(), serde_json::to_value(val)?);
+                    }
+                    row_map.insert("__source".to_string(), serde_json::Value::Object(src_map));
+
+                    let mut tgt_map = serde_json::Map::new();
+                    for (schema_idx, &val_idx) in
+                        rel_mapping.target.fields_input_idx.key.iter().enumerate()
+                    {
+                        let field = &rel_mapping.target.schema.key_fields[schema_idx];
+                        let val = &item.value.fields[val_idx];
+                        tgt_map.insert(field.name.clone(), serde_json::to_value(val)?);
+                    }
+                    for (schema_idx, &val_idx) in
+                        rel_mapping.target.fields_input_idx.value.iter().enumerate()
+                    {
+                        let field = &rel_mapping.target.schema.value_fields[schema_idx];
+                        let val = &item.value.fields[val_idx];
+                        tgt_map.insert(field.name.clone(), serde_json::to_value(val)?);
+                    }
+                    row_map.insert("__target".to_string(), serde_json::Value::Object(tgt_map));
                 }
             }
             rows.push(serde_json::Value::Object(row_map));
