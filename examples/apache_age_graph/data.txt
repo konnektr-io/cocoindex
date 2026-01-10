@@ -1,0 +1,4 @@
+Apache AGE is a graph extension for PostgreSQL.
+It enables graph queries using openCypher.
+CocoIndex now supports AGE!
+Connect your data to knowledge graphs easily.

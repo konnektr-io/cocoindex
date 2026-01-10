@@ -151,3 +151,34 @@ class KuzuDeclaration(op.DeclarationSpec):
     connection: AuthEntryReference[KuzuConnection]
     nodes_label: str
     primary_key_fields: Sequence[str]
+
+
+@dataclass
+class AgeConnection:
+    """Connection spec for Apache AGE."""
+
+    # PostgreSQL connection components
+    host: str = "localhost"
+    port: int = 5432
+    user: str = "postgres"
+    password: str | None = None
+    database: str = "postgres"
+    # AGE graph name
+    graph_name: str = "cocoindex"
+
+
+class Age(op.TargetSpec):
+    """Graph storage powered by Apache AGE (PostgreSQL extension)."""
+
+    connection: AuthEntryReference[AgeConnection]
+    mapping: Nodes | Relationships
+
+
+class AgeDeclaration(op.DeclarationSpec):
+    """Declarations for Apache AGE."""
+
+    kind = "Age"
+    connection: AuthEntryReference[AgeConnection]
+    nodes_label: str
+    primary_key_fields: Sequence[str]
+    vector_indexes: Sequence[index.VectorIndexDef] = ()

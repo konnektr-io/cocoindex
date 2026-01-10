@@ -27,6 +27,7 @@ fn register_executor_factories(registry: &mut ExecutorFactoryRegistry) -> Result
     targets::kuzu::register(registry, reqwest_client)?;
 
     targets::neo4j::Factory::new().register(registry)?;
+    targets::age::Factory::new().register(registry)?;
 
     Ok(())
 }
