@@ -1,57 +1,37 @@
 use crate::prelude::*;
 
 use super::shared::property_graph::*;
-use crate::setup::components::{self, State, apply_component_changes, SetupStateCompatibility};
+use crate::setup::components::{self, State};
+use crate::ops::sdk::{SetupStateCompatibility, TypedResourceSetupChangeItem};
 use crate::setup::{ResourceSetupChange, SetupChangeType};
 use crate::{ops::sdk::*, setup::CombinedState};
 use crate::settings::DatabaseConnectionSpec;
-use crate::ops::shared::postgres::get_db_pool;
 
-use indoc::formatdoc;
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use std::fmt::Write;
-use std::collections::BTreeMap;
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct ConnectionSpec {
-    pub host: String,
-    pub port: Option<u16>,
-    pub user: String,
-    pub password: Option<String>,
-    pub database: String,
-    pub graph_name: String,
-}
-
-impl From<&ConnectionSpec> for DatabaseConnectionSpec {
-    fn from(spec: &ConnectionSpec) -> Self {
-        Self {
-            host: spec.host.clone(),
-            port: spec.port.unwrap_or(5432),
-            user: spec.user.clone(),
-            password: spec.password.clone(),
-            database: spec.database.clone(),
-        }
-    }
-}
+use std::collections::HashMap;
+use indexmap::IndexSet;
 
 #[derive(Debug, Deserialize)]
 pub struct Spec {
-    connection: spec::AuthEntryReference<ConnectionSpec>,
-    mapping: std::sync::Arc<GraphElementMapping>,
+    pub connection: spec::AuthEntryReference<DatabaseConnectionSpec>,
+    pub graph_name: String,
+    pub mapping: GraphElementMapping,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Declaration {
-    connection: spec::AuthEntryReference<ConnectionSpec>,
+    pub connection: spec::AuthEntryReference<DatabaseConnectionSpec>,
+    pub graph_name: String,
     #[serde(flatten)]
-    decl: GraphDeclaration,
+    pub decl: GraphDeclaration,
 }
 
-type AgeGraphElement = GraphElementType<ConnectionSpec>;
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-struct GraphKey {
-    connection: spec::AuthEntryReference<ConnectionSpec>,
+pub struct AgeGraphElement {
+    pub connection: spec::AuthEntryReference<DatabaseConnectionSpec>,
+    pub graph_name: String,
+    pub typ: ElementType,
 }
 
 pub struct Factory;
@@ -160,8 +140,6 @@ impl SetupState {
             .collect::<HashMap<_, _>>();
 
         if !index_options.fts_indexes.is_empty() {
-             // FTS not supported yet
-             // We can ignore or error. Neo4j errors.
              api_bail!("FTS indexes are not supported for Age target");
         }
 
@@ -188,8 +166,7 @@ impl SetupState {
             sub_components,
         })
     }
-
-impl components::SetupStateCompatibilityCheck for SetupState {
+    
     fn check_compatible(&self, existing: &Self) -> SetupStateCompatibility {
         if self.key_field_names == existing.key_field_names {
             SetupStateCompatibility::Compatible
@@ -214,7 +191,6 @@ impl IndexDef {
         field_typ: &schema::ValueType,
     ) -> Result<Self> {
         let method = index_def.method.clone();
-        // Support IvfFlat and Hnsw for pgvector
         Ok(Self::VectorIndex {
             field_name: index_def.field_name.clone(),
             vector_size: (match field_typ {
@@ -232,10 +208,48 @@ impl IndexDef {
     }
 }
 
+#[derive(Clone)]
 struct SetupComponentOperator {
     pool: PgPool,
-    conn_spec: ConnectionSpec,
+    graph_name: String,
     has_pgvector: bool,
+}
+
+impl SetupComponentOperator {
+    async fn get_graph_oid(&self, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<u32> {
+        let oid: i32 = sqlx::query_scalar("SELECT graphid FROM ag_catalog.ag_graph WHERE name = $1")
+            .bind(&self.graph_name)
+            .fetch_one(&mut **tx)
+            .await?;
+        Ok(oid as u32)
+    }
+
+    async fn ensure_label_exists(
+        &self, 
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, 
+        label: &str, 
+        is_edge: bool
+    ) -> Result<()> {
+        let graph = &self.graph_name;
+        // Check if label exists
+        let exists: bool = sqlx::query_scalar(
+            "SELECT count(*) > 0 FROM ag_catalog.ag_label WHERE name = $1 AND graph = (SELECT graphid FROM ag_catalog.ag_graph WHERE name = $2)"
+        )
+        .bind(label)
+        .bind(graph)
+        .fetch_one(&mut **tx)
+        .await?;
+
+        if !exists {
+             let create_q = if is_edge {
+                 format!("SELECT create_elabel('{}', '{}')", graph, label)
+             } else {
+                 format!("SELECT create_vlabel('{}', '{}')", graph, label)
+             };
+             sqlx::query(&create_q).execute(&mut **tx).await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -268,62 +282,30 @@ impl components::SetupOperator for SetupComponentOperator {
         }
     }
 
-    async fn is_up_to_date(
+    fn is_up_to_date(
         &self,
-        key: &Self::Key,
-        _state: &Self::State,
-        _context: &Self::Context,
-    ) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
-        sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
-
-        // Check if index exists in the graph's schema
-        let index_name = &key.name;
-        let schema_name = &self.conn_spec.graph_name;
-
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
-                SELECT 1 FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relname = $1 AND c.relkind = 'i'
-                AND n.nspname = $2
-            )"
-        )
-        .bind(index_name)
-        .bind(schema_name)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok(exists)
+        current: &Self::State,
+        desired: &Self::State,
+    ) -> bool {
+        current == desired
     }
 
     async fn create(&self, state: &Self::State, _context: &Self::Context) -> Result<()> {
-         match &state.index_def {
-            IndexDef::VectorIndex { .. } => {
-                if !self.has_pgvector {
-                   tracing::warn!("Skipping vector index creation as pgvector extension is missing");
-                   return Ok(());
-                }
-            }
-            _ => {}
+         if matches!(state.index_def, IndexDef::VectorIndex { .. }) && !self.has_pgvector {
+            tracing::warn!("Skipping vector index creation as pgvector extension is missing");
+            return Ok(())
          }
 
          let mut tx = self.pool.begin().await?;
          sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
          sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
 
-         let graph = &self.conn_spec.graph_name;
+         let graph = &self.graph_name;
          let label = state.object_label.label();
          let is_edge = matches!(state.object_label, ElementType::Relationship(_));
 
-         let create_label_q = if is_edge {
-             format!("SELECT create_elabel('{}', '{}')", graph, label)
-         } else {
-             format!("SELECT create_vlabel('{}', '{}')", graph, label)
-         };
-         sqlx::query(&create_label_q).execute(&mut *tx).await?;
+         // Ensure label exists before creating index on it
+         self.ensure_label_exists(&mut tx, label, is_edge).await?;
 
          let index_name = state.key().name;
          let q_graph = format!("\"{}\"", graph);
@@ -340,20 +322,46 @@ impl components::SetupOperator for SetupComponentOperator {
                  let sql = format!("CREATE UNIQUE INDEX {} ON {}.{} ({})", q_index, q_graph, q_label, exprs);
                  sqlx::query(&sql).execute(&mut *tx).await?;
              }
-             IndexDef::VectorIndex { field_name, metric, method, .. } => {
+             IndexDef::VectorIndex { field_name, metric, method, vector_size } => {
+                 let graph_oid = self.get_graph_oid(&mut tx).await?;
+                 
                  let ops = match metric {
-                    spec::VectorSimilarityMetric::L2 => "vector_l2_ops",
-                    spec::VectorSimilarityMetric::Cosine => "vector_cosine_ops",
+                    spec::VectorSimilarityMetric::L2Distance => "vector_l2_ops",
+                    spec::VectorSimilarityMetric::CosineSimilarity => "vector_cosine_ops",
                     spec::VectorSimilarityMetric::InnerProduct => "vector_ip_ops",
                  };
                  let method_str = match method {
-                     Some(spec::VectorIndexMethod::Hnsw) | None => "hnsw",
-                     Some(spec::VectorIndexMethod::IvfFlat) => "ivfflat",
+                     Some(spec::VectorIndexMethod::Hnsw { .. }) | None => "hnsw",
+                     Some(spec::VectorIndexMethod::IvfFlat { .. }) => "ivfflat",
                  };
+                 
+                 // Handle method options
+                 let options = match method {
+                     Some(spec::VectorIndexMethod::Hnsw { m, ef_construction }) => {
+                         let mut opts = Vec::new();
+                         if let Some(val) = m { opts.push(format!("m = {}", val)); } 
+                         if let Some(val) = ef_construction { opts.push(format!("ef_construction = {}", val)); } 
+                         opts
+                     },
+                     Some(spec::VectorIndexMethod::IvfFlat { lists }) => {
+                         let mut opts = Vec::new();
+                         if let Some(val) = lists { opts.push(format!("lists = {}", val)); } 
+                         opts
+                     },
+                     None => Vec::new(),
+                 };
+                 let with_clause = if options.is_empty() { String::new() } else { format!(" WITH ({})", options.join(", ")) };
+
+                 // Complex expression for AGE vector index
+                 let expr_inner = format!(
+                     r#"agtype_access_operator(VARIADIC ARRAY[_agtype_build_vertex(id, _label_name({}::oid, id), properties), '"{}"'::agtype])::text"#,
+                     graph_oid, field_name
+                 );
+                 let expr = format!("(({})::vector({}))", expr_inner, vector_size);
 
                  let sql = format!(
-                     "CREATE INDEX {} ON {}.{} USING {} (((properties ->> '{}')::vector) {})",
-                     q_index, q_graph, q_label, method_str, field_name, ops
+                     "CREATE INDEX {} ON {}.{} USING {} ({}) {}{}",
+                     q_index, q_graph, q_label, method_str, expr, ops, with_clause
                  );
                  sqlx::query(&sql).execute(&mut *tx).await?;
              }
@@ -365,12 +373,8 @@ impl components::SetupOperator for SetupComponentOperator {
 
     async fn delete(&self, key: &Self::Key, _context: &Self::Context) -> Result<()> {
          let mut tx = self.pool.begin().await?;
-         sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
-         sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
-
-         let index_name = &key.name;
-         let q_graph = format!("\"{}\"", self.conn_spec.graph_name);
-         let q_index = format!("\"{}\"", index_name);
+         let q_graph = format!("\"{}\"", self.graph_name);
+         let q_index = format!("\"{}\"", key.name);
          let sql = format!("DROP INDEX IF EXISTS {}.{}", q_graph, q_index);
 
          sqlx::query(&sql).execute(&mut *tx).await?;
@@ -380,11 +384,40 @@ impl components::SetupOperator for SetupComponentOperator {
 }
 
 pub struct AgeSetupChange {
-    component_change: components::SetupChange<SetupState>,
+    component_change: components::SetupChange<SetupComponentOperator>,
     pool: PgPool,
-    conn_spec: ConnectionSpec,
-    label_to_clean: Option<String>,
-    has_pgvector: bool,
+    graph_name: String,
+    label_to_clean: Option<DataClearAction>,
+}
+
+impl AgeSetupChange {
+    async fn apply_change(&self) -> Result<()> {
+        if let Some(action) = &self.label_to_clean {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
+            sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
+
+            let graph = &self.graph_name;
+            let cypher = format!("MATCH (n:{}) DETACH DELETE n", action.label);
+            let sql = format!("SELECT * FROM cypher('{}', $$ {} $$) as (v agtype)", graph, cypher);
+            
+            if let Err(e) = sqlx::query(&sql).execute(&mut *tx).await {
+                tracing::warn!("Failed to clear data for label {}: {}", action.label, e);
+            }
+
+            tx.commit().await?;
+        }
+
+        components::apply_component_changes(vec![&self.component_change], &()).await?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct DataClearAction {
+    label: String,
+    dependent_node_labels: Vec<String>,
 }
 
 impl ResourceSetupChange for AgeSetupChange {
@@ -397,54 +430,25 @@ impl ResourceSetupChange for AgeSetupChange {
 
     fn describe_changes(&self) -> Vec<crate::setup::ChangeDescription> {
         let mut changes = self.component_change.describe_changes();
-        if let Some(label) = &self.label_to_clean {
-             changes.push(crate::setup::ChangeDescription::Action(format!(
-                "Clear data for label '{}'",
-                label
-            )));
+        if let Some(action) = &self.label_to_clean {
+             let mut desc = format!("Clear data for label '{}'", action.label);
+             if !action.dependent_node_labels.is_empty() {
+                 write!(&mut desc, "; dependents: {}", action.dependent_node_labels.join(", ")).unwrap();
+             }
+             changes.push(crate::setup::ChangeDescription::Action(desc));
         }
         changes
-    }
-
-    fn apply_change(&self) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async {
-            let operator = SetupComponentOperator {
-                pool: self.pool.clone(),
-                conn_spec: self.conn_spec.clone(),
-                has_pgvector: self.has_pgvector,
-            };
-            self.component_change.apply_change(&operator, &()).await?;
-
-            if let Some(label) = &self.label_to_clean {
-                let mut tx = self.pool.begin().await?;
-                sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
-                sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
-
-                let cypher = format!("MATCH (n:{}) DETACH DELETE n", label);
-                let sql = format!("SELECT * FROM cypher('{}', $$ {} $$) as (v agtype)", self.conn_spec.graph_name, cypher);
-                
-                // We execute and ignore error? 
-                // Using sqlx::query(...).execute()
-                if let Err(e) = sqlx::query(&sql).execute(&mut *tx).await {
-                    // Log but ignore if graph/label missing?
-                    tracing::warn!("Failed to clear data for label {}: {}", label, e);
-                }
-
-                tx.commit().await?;
-            }
-            Ok(())
-        })
     }
 }
 
 async fn get_connection_pool(
-    conn_ref: &spec::AuthEntryReference<ConnectionSpec>,
+    conn_ref: &spec::AuthEntryReference<DatabaseConnectionSpec>,
     auth_registry: &AuthRegistry
 ) -> Result<PgPool> {
     let conn_spec = auth_registry.get(conn_ref)?;
-    let db_spec: DatabaseConnectionSpec = conn_spec.into();
+    // DatabaseConnectionSpec is compatible with get_pool, no need for conversion
     let lib_context = get_lib_context().await?;
-    lib_context.db_pools.get_pool(&db_spec).await
+    lib_context.db_pools.get_pool(&conn_spec).await
 }
 
 async fn check_pgvector(pool: &PgPool) -> Result<bool> {
@@ -453,125 +457,21 @@ async fn check_pgvector(pool: &PgPool) -> Result<bool> {
     Ok(count > 0)
 }
 
-struct ExportContext {
-    pool: PgPool,
-    conn_spec: ConnectionSpec,
-    analyzed_data_coll: AnalyzedDataCollection,
-    upsert_cypher: String,
-    delete_cypher: String,
-}
-
-impl ExportContext {
-    fn extract_key_params(&self, key: &Key) -> Result<serde_json::Map<String, serde_json::Value>> {
-        let mut map = serde_json::Map::new();
-        // analyzed_data_coll.schema.key_fields -> Vec<GraphFieldSchema>
-        // Key match logic:
-        // If single key field, key is value.
-        // If multiple, key is struct (Value::Struct).
-        
-        let key_fields = &self.analyzed_data_coll.schema.key_fields;
-        if key_fields.len() == 1 {
-            let field = &key_fields[0];
-            let val = serde_json::to_value(key)?;
-            map.insert(field.name.clone(), val);
-        } else {
-             // Expect composite key
-             match key {
-                 Key::Struct(fields) => {
-                     for field in key_fields {
-                         let val = fields.get(&field.name).ok_or_else(|| {
-                             api_error!("Missing key field part: {}", field.name)
-                         })?;
-                         map.insert(field.name.clone(), serde_json::to_value(val)?);
-                     }
-                 }
-                 _ => api_bail!("Expected Struct key for composite key fields, got {:?}", key),
-             }
-        }
-        Ok(map)
-    }
-
-    fn extract_value_params(&self, values: Vec<Value>) -> Result<serde_json::Map<String, serde_json::Value>> {
-        let mut map = serde_json::Map::new();
-        // values correspond to self.analyzed_data_coll.value_fields_input_idx
-        // But Input idx points to which input field maps to the schema value field?
-        // Actually values come from `Mutation::Upsert(values)`.
-        // The `values` vector matches `spec.mapping` fields order?
-        // No, `Mutation` holds `values: Vec<Value>`.
-        // The order corresponds to `analyzed_data_coll.value_fields_input_idx`.
-        
-        // Wait, `Mutation` values are provided by pipeline.
-        // Usually target expects them in a specific order defined by `spec`.
-        // analyzed_data_coll has `value_fields_input_idx`.
-        
-        for (i, val) in values.into_iter().enumerate() {
-            // Find which schema field this corresponds to.
-            // analyzed_data_coll.schema.value_fields[i]?
-            // Usually valid.
-            if i < self.analyzed_data_coll.schema.value_fields.len() {
-                let schema_field = &self.analyzed_data_coll.schema.value_fields[i];
-                let json_val = serde_json::to_value(val)?;
-                map.insert(schema_field.name.clone(), json_val);
-            }
-        }
-        Ok(map)
-    }
-}
-
-#[async_trait]
-impl Executor for ExportContext {
-    async fn mutate(&mut self, batch: MutationBatch) -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
-        sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
-
-        let (upserts, deletes): (Vec<_>, Vec<_>) = batch.into_iter().partition(|m| m.is_upsert());
-
-        if !deletes.is_empty() {
-            let mut batch_data = Vec::with_capacity(deletes.len());
-            for item in deletes {
-                let props = self.extract_key_params(&item.key)?;
-                batch_data.push(serde_json::Value::Object(props));
-            }
-            let params = serde_json::json!({ "batch": batch_data });
-            let sql = format!("SELECT * FROM cypher('{}', $$ {} $$, $1) as (v agtype)", self.conn_spec.graph_name, self.delete_cypher);
-            sqlx::query(&sql).bind(sqlx::types::Json(params)).execute(&mut *tx).await?;
-        }
-
-        if !upserts.is_empty() {
-            let mut batch_data = Vec::with_capacity(upserts.len());
-            for item in upserts {
-                let mut props = self.extract_key_params(&item.key)?;
-                // into_values() consumes mutation
-                if let Mutation::Upsert(values) = item {
-                    let val_props = self.extract_value_params(values)?;
-                    props.extend(val_props);
-                }
-                batch_data.push(serde_json::Value::Object(props));
-            }
-            let params = serde_json::json!({ "batch": batch_data });
-            let sql = format!("SELECT * FROM cypher('{}', $$ {} $$, $1) as (v agtype)", self.conn_spec.graph_name, self.upsert_cypher);
-            sqlx::query(&sql).bind(sqlx::types::Json(params)).execute(&mut *tx).await?;
-        }
-
-        tx.commit().await?;
-        Ok(())
-    }
+pub struct ExportContext {
+    pub pool: PgPool,
+    pub graph_name: String,
+    pub analyzed_data_coll: AnalyzedDataCollection,
+    pub upsert_cypher: String,
+    pub delete_cypher: String,
 }
 
 fn generate_cypher_upsert(coll: &AnalyzedDataCollection, has_pgvector: bool) -> Result<String> {
     use std::fmt::Write;
     let mut q = String::new();
     
-    write!(q, "UNWIND $batch AS row ").unwrap();
-    
     match &coll.schema.elem_type {
         ElementType::Node(label) => {
-            let key_props_match = coll.schema.key_fields.iter()
+            let key_props_match = coll.schema.key_fields.iter() 
                 .map(|f| format!("{}: row.{}", f.name, f.name))
                 .collect::<Vec<_>>().join(", ");
                 
@@ -591,8 +491,7 @@ fn generate_cypher_upsert(coll: &AnalyzedDataCollection, has_pgvector: bool) -> 
             }
         }
         ElementType::Relationship(_) => {
-             // Relationship support TODO: fully implement key mapping
-             api_bail!("Relationship support not fully implemented for AGE target");
+             api_bail!("Relationship support not fully implemented for AGE target yet");
         }
     }
     Ok(q)
@@ -601,10 +500,9 @@ fn generate_cypher_upsert(coll: &AnalyzedDataCollection, has_pgvector: bool) -> 
 fn generate_cypher_delete(coll: &AnalyzedDataCollection) -> Result<String> {
     use std::fmt::Write;
     let mut q = String::new();
-    write!(q, "UNWIND $batch AS row ").unwrap();
     match &coll.schema.elem_type {
         ElementType::Node(label) => {
-            let key_props_match = coll.schema.key_fields.iter()
+            let key_props_match = coll.schema.key_fields.iter() 
                 .map(|f| format!("{}: row.{}", f.name, f.name))
                 .collect::<Vec<_>>().join(", ");
             write!(q, "MATCH (n:{} {{ {} }}) DETACH DELETE n", label, key_props_match).unwrap();
@@ -620,258 +518,277 @@ impl TargetFactoryBase for Factory {
     type DeclarationSpec = Declaration;
     type SetupState = SetupState;
     type SetupChange = AgeSetupChange;
-    type Executor = ExportContext;
-    type AdditionalDataCollectionInfo = ();
+    type SetupKey = AgeGraphElement;
+    type ExportContext = ExportContext;
+
+    fn name(&self) -> &str {
+        "Age"
+    }
 
     async fn build(
-        spec: &Self::Spec,
-        declarations: &[Self::DeclarationSpec],
-        _auth_registry: &AuthRegistry,
-    ) -> Result<(TypedExportDataCollectionBuildOutput<Self>, TypedExportDataCollectionSpec<Self>)> {
-        let (analyzed_data_coll, _) = analyze_graph_element_schema(
-            &spec.mapping,
-            declarations.iter().map(|d| (&d.decl, &d.connection)).collect(),
+        self: Arc<Self>,
+        data_collections: Vec<TypedExportDataCollectionSpec<Self>>,
+        declarations: Vec<Declaration>,
+        context: Arc<FlowInstanceContext>,
+    ) -> Result<(Vec<TypedExportDataCollectionBuildOutput<Self>>,
+        Vec<(AgeGraphElement, SetupState)>)> {
+        let (analyzed_data_colls, declared_graph_elements) = analyze_graph_mappings(
+            data_collections.iter().map(|d| DataCollectionGraphMappingInput {
+                auth_ref: &d.spec.connection,
+                mapping: &d.spec.mapping,
+                index_options: &d.index_options,
+                key_fields_schema: d.key_fields_schema.clone(),
+                value_fields_schema: d.value_fields_schema.clone(),
+            }),
+            declarations.iter().map(|d| (&d.connection, &d.decl)),
         )?;
 
-        Ok((
-            TypedExportDataCollectionBuildOutput {
-                analyzed_collection: analyzed_data_coll,
-            },
-            TypedExportDataCollectionSpec {
-                spec: spec.mapping.clone(),
-                additional_info: (),
-            },
-        ))
-    }
+        let data_coll_output = std::iter::zip(data_collections, analyzed_data_colls)
+             .map(|(data_coll, analyzed)| {
+                 let setup_key = AgeGraphElement {
+                     connection: data_coll.spec.connection.clone(),
+                     graph_name: data_coll.spec.graph_name.clone(),
+                     typ: analyzed.schema.elem_type.clone(),
+                 };
+                 let desired_setup_state = SetupState::new(
+                     &analyzed.schema,
+                     &data_coll.index_options,
+                     analyzed
+                        .dependent_node_labels()
+                        .into_iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                 )?;
 
-    async fn describe_resource(&self, key: &spec::AuthEntryReference<ConnectionSpec>) -> Result<String> {
-        Ok(format!("Age Graph '{}'", key.name))
-    }
+                 let conn_spec_ref = data_coll.spec.connection.clone();
+                 let graph_name = data_coll.spec.graph_name.clone();
+                 let auth_registry = context.auth_registry.clone();
+                 
+                 let export_context = async move {
+                     let pool = get_connection_pool(&conn_spec_ref, &auth_registry).await?;
+                     let has_pgvector = check_pgvector(&pool).await?;
+                     
+                     let upsert = generate_cypher_upsert(&analyzed, has_pgvector)?;
+                     let delete = generate_cypher_delete(&analyzed)?;
+                     
+                     Ok(Arc::new(ExportContext {
+                         pool,
+                         graph_name,
+                         analyzed_data_coll: analyzed,
+                         upsert_cypher: upsert,
+                         delete_cypher: delete,
+                     }))
+                 }
+                 .boxed();
 
-    fn normalize_setup_key(&self, key: &serde_json::Value) -> Result<serde_json::Value> {
-        Ok(key.clone())
+                 Ok(TypedExportDataCollectionBuildOutput {
+                     setup_key,
+                     desired_setup_state,
+                     export_context,
+                 })
+             })
+             .collect::<Result<Vec<_>>>()?;
+
+        let decl_output = std::iter::zip(declarations, declared_graph_elements)
+            .map(|(decl, graph_elem_schema)| {
+                let setup_state = SetupState::new(&graph_elem_schema, &decl.decl.index_options, vec![])?;
+                let setup_key = AgeGraphElement {
+                    connection: decl.connection,
+                    graph_name: decl.graph_name,
+                    typ: graph_elem_schema.elem_type.clone(),
+                };
+                Ok((setup_key, setup_state))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok((data_coll_output, decl_output))
     }
 
     async fn diff_setup_states(
         &self,
-        key: &serde_json::Value, // GraphKey? No, serde_json::Value.
+        key: AgeGraphElement,
         desired: Option<SetupState>,
         existing: CombinedState<SetupState>,
-        _ctx: Arc<FlowInstanceContext>,
-    ) -> Result<Option<AgeSetupChange>> {
-        // Key is GraphKey struct (connection ref).
-        // But setup key is used for filtering?
-        // Actually, diff_setup_states relies on key identifying the resource (GraphElement).
-        // But here key is provided.
-        // We construct diff.
-        
-        // Resolve pool to construct setup operator?
-        // AgeSetupChange needs pool.
-        // But `diff_setup_states` doesn't return pool-bearing struct easily if we don't have it?
-        // We need conn_spec.
-        // key -> conn_spec?
-        // `Factory` doesn't hold connection info.
-        // But `key` passed here matches `Spec::connection`.
-        // Wait, `SetupState` belongs to a resource.
-        // Where do we get `ConnectionSpec`?
-        // Usually from `key` if it contains it.
-        // `GraphElementType`? (defined in shared)
-        // `AgeGraphElement`.
-        
-        // key is `AgeGraphElement`.
-        let graph_elem: AgeGraphElement = serde_json::from_value(key.clone()).map_err(|e| {
-            api_error!("Failed to deserialize setup key: {}", e)
-        })?;
-        
-        let conn_ref = &graph_elem.connection;
-        // We need AuthRegistry to resolve conn_ref.
-        // But diff_setup_states doesn't have AuthRegistry passed?
-        // `ctx` has `FlowInstanceContext`.
-        // `ctx.lib_context`?
-        // `get_lib_context().await?`
-        
-        // To get pool, we need AuthRegistry.
-        // `diff_setup_states` allows async.
-        // We assume we can get registry globally or context has it.
-        // `TargetFactoryBase` doesn't pass AuthRegistry explicitly here.
-        // But we can get it from `get_lib_context`.
-        let lib_ctx = get_lib_context().await?;
-        let auth = &lib_ctx.auth_registry;
-        let pool = get_connection_pool(conn_ref, auth).await?;
-        let conn_spec = auth.get(conn_ref)?;
-        
+        context: Arc<FlowInstanceContext>,
+    ) -> Result<Self::SetupChange> {
+        let pool = get_connection_pool(&key.connection, &context.auth_registry).await?;
+        let has_pgvector = check_pgvector(&pool).await?;
+
         let operator = SetupComponentOperator {
             pool: pool.clone(),
-            conn_spec: conn_spec.clone(),
-            has_pgvector: check_pgvector(&pool).await?,
+            graph_name: key.graph_name.clone(),
+            has_pgvector,
         };
 
-        let component_change = components::diff_setup_states(
-            &operator,
-            desired.as_ref().map(|s| s.into_iter().collect()).unwrap_or_default(),
-            existing.iter().flat_map(|s| s.sub_components.iter().cloned()).collect(),
-            &(),
-        ).await?;
+        // Determine data clear actions
+        let mut label_to_clean = None;
+        if let Some(existing_state) = existing.possible_versions().next() {
+            let is_incompatible = if let Some(desired) = &desired {
+                desired.check_compatible(existing_state) == SetupStateCompatibility::NotCompatible
+            } else {
+                true
+            };
 
-        // Logic for data clearing if desired is None?
-        let label_to_clean = if desired.is_none() && existing.exists() {
-             // If resource removed, we clear data?
-             // Only if resource being removed implies data drop.
-             // Usually yes.
-             Some(graph_elem.typ.label().to_string())
-        } else {
-             None
-        };
-        
-        if component_change.is_none() && label_to_clean.is_none() {
-            return Ok(None);
+            if is_incompatible {
+                 label_to_clean = Some(DataClearAction {
+                     label: key.typ.label().to_string(),
+                     dependent_node_labels: existing_state.dependent_node_labels.clone(),
+                 });
+            }
         }
+        
+        let component_change = components::SetupChange::create(
+            operator,
+            desired,
+            existing,
+        )?;
 
-        Ok(Some(AgeSetupChange {
-            component_change: component_change.unwrap_or_default(),
-            pool: pool.clone(),
-            conn_spec,
+        Ok(AgeSetupChange {
+            component_change,
+            pool,
+            graph_name: key.graph_name,
             label_to_clean,
-            has_pgvector: operator.has_pgvector,
-        }))
+        })
+    }
+
+    fn check_state_compatibility(
+        &self,
+        desired: &SetupState,
+        existing: &SetupState,
+    ) -> Result<SetupStateCompatibility> {
+        Ok(desired.check_compatible(existing))
+    }
+
+    fn describe_resource(&self, key: &AgeGraphElement) -> Result<String> {
+        Ok(format!("Age Graph Element '{}' in Graph '{}' (Connection '{}')", key.typ, key.graph_name, key.connection.key))
     }
 
     async fn apply_setup_changes(
         &self,
-        changes: Vec<interface::ResourceSetupChangeItem<'_, AgeSetupChange>>,
-        _ctx: Arc<FlowInstanceContext>,
+        changes: Vec<TypedResourceSetupChangeItem<'async_trait, Self>>,
+        _context: Arc<FlowInstanceContext>,
     ) -> Result<()> {
-         // Create graphs if needed.
-         // Since `apply_setup_changes` batch might contain multiple graphs.
-         // We should unique by graph name and create graph.
-         // But AgeSetupChange holds pool and conn_spec.
+         // Group by graph to ensure graph exists
+         let mut visited_graphs = IndexSet::new(); // Store "graph_name"
          
-         // Iterate changes, create graph first.
          for change in &changes {
-             let sc = change.setup_change;
-             // Ensure graph exists
-             let mut tx = sc.pool.begin().await?;
-             // LOAD 'age'
-             sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
-             sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
+             let sc = &change.setup_change;
+             let key = &sc.graph_name; 
              
-             let graph = &sc.conn_spec.graph_name;
-             // create_graph returns void? "SELECT create_graph('name')". 
-             // Checks existence?
-             // AGE: "create_graph() ... Error if exists."
-             // So we must check existence.
-             let exists: bool = sqlx::query_scalar("SELECT count(*) > 0 FROM ag_graph WHERE name = $1")
-                 .bind(graph)
-                 .fetch_one(&mut *tx)
-                 .await?;
+             if !visited_graphs.contains(key) {
+                 visited_graphs.insert(key.clone());
                  
-             if !exists {
-                 sqlx::query(&format!("SELECT create_graph('{}')", graph)).execute(&mut *tx).await?;
+                 let mut tx = sc.pool.begin().await?;
+                 sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
+                 sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
+                 
+                 let exists: bool = sqlx::query_scalar("SELECT count(*) > 0 FROM ag_graph WHERE name = $1")
+                     .bind(&sc.graph_name)
+                     .fetch_one(&mut *tx)
+                     .await?;
+                     
+                 if !exists {
+                     sqlx::query(&format!("SELECT create_graph('{}')", sc.graph_name)).execute(&mut *tx).await?;
+                 }
+                 tx.commit().await?;
              }
-             tx.commit().await?;
          }
-         
+
          for change in changes {
              change.setup_change.apply_change().await?;
          }
          Ok(())
     }
 
-    async fn prepare(
+    async fn apply_mutation(
         &self,
-        spec: &Self::Spec,
-        data_coll_spec: TypedExportDataCollectionSpec<Self>,
-        auth_registry: &AuthRegistry,
-    ) -> Result<Self::Executor> {
-        let pool = get_connection_pool(&spec.connection, auth_registry).await?;
-        let conn_spec = auth_registry.get(&spec.connection)?;
-        
-        let (analyzed_data_coll, _) = analyze_graph_element_schema(
-            &data_coll_spec.spec, // Use cloned spec from data_coll_spec
-            vec![], // No declarations needed here for re-analysis or use cached?
-            // analyze_graph_element_schema expects Declarations to resolve primary keys etc.
-            // If declarations missing, might default?
-            // BUT `TypedExportDataCollectionSpec` only stored `mapping` (Spec).
-            // It did NOT store `Declarations`.
-            // Neo4j stores `Declarations`?
-            // Neo4j `prepare` re-analyzes.
-            // IF `Declarations` are required for key fields, we need them.
-            // `declarations` were passed to `build`.
-            // If they are needed at runtime, `TypedExportDataCollectionSpec` should store them or `AnalyzedDataCollection` should be passed.
-            // But `TypedExportDataCollectionSpec` is what we passed back from `build`.
-            // We can store `AnalyzedDataCollection` in `AdditionalDataCollectionInfo`!
-            // `type AdditionalDataCollectionInfo = AnalyzedDataCollection;`
-            // Then we don't need to re-analyze.
-            
-            // Refactor `AdditionalDataCollectionInfo` to store `AnalyzedDataCollection`.
-        )?;
-        // Wait, I used `type AdditionalDataCollectionInfo = ();`.
-        // I should change it to `AnalyzedDataCollection`.
-        // Then `prepare` gets `data_coll_spec.additional_info`.
-        
-        // I will do this refactor in this block?
-        // `AnalyzedDataCollection` is public.
-        // Is it Clone? It contains `Arc<GraphElementSchema>` and `Vec<usize>`.
-        // `GraphElementSchema` might not be Clone? `Arc` is.
-        // `AnalyzedRelationshipInfo` (in Option) is Clone?
-        // Let's check shared `property_graph.rs` again.
-        // It does NOT derive Clone for `AnalyzedDataCollection`.
-        
-        // So I cannot put it in `AdditionalDataCollectionInfo` easily if it requires Clone.
-        // `TypedExportDataCollectionSpec` derives `Serialize, Deserialize, Debug`.
-        // `AnalyzedDataCollection` is not Serialize/Deserialize.
-        
-        // So I must re-analyze.
-        // If re-analyze, I need Declarations?
-        // `analyze_graph_element_schema` uses declarations to find primary keys if specified in declaration.
-        // If not, it uses spec.
-        // If declarations are missing in `prepare`, we might lose key info?
-        // Yes, if keys defined in Decl.
-        // So `TypedExportDataCollectionSpec` MUST persist simple key info or Declarations.
-        // Neo4j persists `spec` (Mapping) and `declarations` (via `decl_spec` field?)
-        // Neo4j `prepare` re-reads decls?
-        // Actually, `TargetFactoryBase` doesn't pass declarations to `prepare` from `build`.
-        // It relies on `TypedExportDataCollectionSpec` to carry state.
-        
-        // If `AdditionalDataCollectionInfo` needs to carry generic info.
-        // `Neo4j` uses `type AdditionalDataCollectionInfo = ();`?
-        // Checks `neo4j.rs`: `type AdditionalDataCollectionInfo = Option<GraphDeclaration>;`?
-        // No, I specifically looked at `impl TargetFactoryBase`.
-        // I didn't see it.
-        
-        // Use `spec` (Mapping) is what I have.
-        // If Mapping contains key info, fine.
-        // If Declarations needed, I am stuck unless I store them.
-        
-        // I'll assume Mapping is sufficient or keys are inferred from it for now.
-        // (Or `declarations` are not used for Keys in `analyze`? they are.)
-        
-        // Implementation detail: I will proceed with re-analysis using empty declarations and hope.
-        // Or better: store `Vec<String>` key fields in `AdditionalDataCollectionInfo`?
-        // But `AdditionalDataCollectionInfo` must be Serde-able.
-        // `Vec<String>` is serde-able.
-        
-        // I'll define `type AdditionalDataCollectionInfo = Vec<String>;` (Key fields).
-        // And pass it from `build`.
-        // Then in prepare, I manually patch `analyzed_data_coll.schema.key_fields`?
-        // Too hacky.
-        
-        // For now, I'll stick to `()` and empty decl.
-        
-        let has_pgvector = check_pgvector(&pool).await?;
-        let upsert = generate_cypher_upsert(&analyzed_data_coll, has_pgvector)?;
-        let delete = generate_cypher_delete(&analyzed_data_coll)?;
-        
-        Ok(ExportContext {
-            pool,
-            conn_spec,
-            analyzed_data_coll,
-            upsert_cypher: upsert,
-            delete_cypher: delete,
-        })
+        mutations: Vec<ExportTargetMutationWithContext<'async_trait, ExportContext>>,
+    ) -> Result<()> {
+        futures::future::try_join_all(mutations.into_iter().map(|m| async move {
+             let ctx = m.export_context;
+             ctx.upsert(&m.mutation.upserts).await?;
+             ctx.delete(&m.mutation.deletes).await?;
+             Ok::<(), Error>(())
+        })).await?;
+        Ok(())
     }
 }
 
+// Helper structs for ExportContext
+impl ExportContext {
+    async fn upsert(&self, upserts: &[ExportTargetUpsertEntry]) -> Result<()> {
+        if upserts.is_empty() { return Ok(()); } 
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
+        sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
 
+        // Convert to JSON
+        let items_json = self.prepare_json(upserts, true)?;
+        
+        let sql = format!(
+            "SELECT * FROM cypher('{}', $$ UNWIND $batch AS row {} $$, $1::agtype) as (v agtype)", 
+            self.graph_name, 
+            self.upsert_cypher
+        );
+        sqlx::query(&sql).bind(items_json).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
 
+    async fn delete(&self, deletes: &[ExportTargetDeleteEntry]) -> Result<()> {
+        if deletes.is_empty() { return Ok(()); } 
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("LOAD 'age'").execute(&mut *tx).await?;
+        sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public").execute(&mut *tx).await?;
 
+        // Convert to JSON
+        let items_json = self.prepare_json_delete(deletes)?;
+
+        let sql = format!(
+            "SELECT * FROM cypher('{}', $$ UNWIND $batch AS row {} $$, $1::agtype) as (v agtype)", 
+            self.graph_name, 
+            self.delete_cypher
+        );
+        sqlx::query(&sql).bind(items_json).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    fn prepare_json(&self, items: &[ExportTargetUpsertEntry], include_values: bool) -> Result<String> {
+        let mut rows = Vec::with_capacity(items.len());
+        for item in items {
+            let mut row_map = serde_json::Map::new();
+            self.fill_key(&mut row_map, &item.key)?;
+            if include_values {
+                for (i, val) in item.value.fields.iter().enumerate() {
+                    if i < self.analyzed_data_coll.schema.value_fields.len() {
+                        let field = &self.analyzed_data_coll.schema.value_fields[i];
+                        row_map.insert(field.name.clone(), serde_json::to_value(val)?);
+                    }
+                }
+            }
+            rows.push(serde_json::Value::Object(row_map));
+        }
+        Ok(serde_json::to_string(&serde_json::json!({ "batch": rows }))?)
+    }
+
+    fn prepare_json_delete(&self, items: &[ExportTargetDeleteEntry]) -> Result<String> {
+        let mut rows = Vec::with_capacity(items.len());
+        for item in items {
+            let mut row_map = serde_json::Map::new();
+            self.fill_key(&mut row_map, &item.key)?;
+            rows.push(serde_json::Value::Object(row_map));
+        }
+        Ok(serde_json::to_string(&serde_json::json!({ "batch": rows }))?)
+    }
+
+    fn fill_key(&self, row_map: &mut serde_json::Map<String, serde_json::Value>, key: &KeyValue) -> Result<()> {
+         for (i, part) in key.iter().enumerate() {
+            if i < self.analyzed_data_coll.schema.key_fields.len() {
+                let field = &self.analyzed_data_coll.schema.key_fields[i];
+                row_map.insert(field.name.clone(), serde_json::to_value(part)?);
+            }
+         }
+        Ok(())
+    }
+}

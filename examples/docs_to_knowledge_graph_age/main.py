@@ -1,0 +1,193 @@
+"""
+This example shows how to extract relationships from documents and build a knowledge graph using Apache AGE.
+"""
+
+import dataclasses
+import cocoindex
+import os
+
+# Configure Apache AGE connection
+age_conn_spec = cocoindex.add_auth_entry(
+    "AgeConnection",
+    cocoindex.targets.AgeConnection(
+        host="localhost",
+        port=5432,
+        user="postgres",
+        password="password", # Change this to your postgres password
+        database="postgres",
+        graph_name="coco_docs_graph",
+    ),
+)
+
+GraphDbSpec = cocoindex.targets.Age
+GraphDbConnection = cocoindex.targets.AgeConnection
+GraphDbDeclaration = cocoindex.targets.AgeDeclaration
+conn_spec = age_conn_spec
+
+
+@dataclasses.dataclass
+class DocumentSummary:
+    """Describe a summary of a document."""
+
+    title: str
+    summary: str
+
+
+@dataclasses.dataclass
+class Relationship:
+    """
+    Describe a relationship between two entities.
+    Subject and object should be Core CocoIndex concepts only, should be nouns. For example, `CocoIndex`, `Incremental Processing`, `ETL`,  `Data` etc.
+    """
+
+    subject: str
+    predicate: str
+    object: str
+
+
+@cocoindex.flow_def(name="DocsToKGAge")
+def docs_to_kg_flow(
+    flow_builder: cocoindex.FlowBuilder, data_scope: cocoindex.DataScope
+) -> None:
+    """
+    Define an example flow that extracts relationship from files and build knowledge graph.
+    """
+    data_scope["documents"] = flow_builder.add_source(
+        cocoindex.sources.LocalFile(
+            path=os.path.join("..", "..", "docs", "docs", "core"),
+            included_patterns=["*.md", "*.mdx"],
+        )
+    )
+
+    document_node = data_scope.add_collector()
+    entity_relationship = data_scope.add_collector()
+    entity_mention = data_scope.add_collector()
+
+    with data_scope["documents"].row() as doc:
+        # extract summary from document
+        doc["summary"] = doc["content"].transform(
+            cocoindex.functions.ExtractByLlm(
+                llm_spec=cocoindex.LlmSpec(
+                    # Supported LLM: https://cocoindex.io/docs/ai/llm
+                    api_type=cocoindex.LlmApiType.OLLAMA,
+                    model="llama3.2",
+                ),
+                output_type=DocumentSummary,
+                instruction="Please summarize the content of the document.",
+            )
+        )
+        document_node.collect(
+            filename=doc["filename"],
+            title=doc["summary"]["title"],
+            summary=doc["summary"]["summary"],
+        )
+
+        # extract relationships from document
+        doc["relationships"] = doc["content"].transform(
+            cocoindex.functions.ExtractByLlm(
+                llm_spec=cocoindex.LlmSpec(
+                    # Supported LLM: https://cocoindex.io/docs/ai/llm
+                    api_type=cocoindex.LlmApiType.OLLAMA,
+                    model="llama3.2",
+                ),
+                output_type=list[Relationship],
+                instruction=(
+                    "Please extract relationships from CocoIndex documents. "
+                    "Focus on concepts and ignore examples and code. "
+                ),
+            )
+        )
+
+        with doc["relationships"].row() as relationship:
+            # relationship between two entities
+            entity_relationship.collect(
+                id=cocoindex.GeneratedField.UUID,
+                subject=relationship["subject"],
+                object=relationship["object"],
+                predicate=relationship["predicate"],
+            )
+            # mention of an entity in a document, for subject
+            entity_mention.collect(
+                id=cocoindex.GeneratedField.UUID,
+                entity=relationship["subject"],
+                filename=doc["filename"],
+            )
+            # mention of an entity in a document, for object
+            entity_mention.collect(
+                id=cocoindex.GeneratedField.UUID,
+                entity=relationship["object"],
+                filename=doc["filename"],
+            )
+
+    # export to AGE
+    document_node.export(
+        "document_node",
+        GraphDbSpec(
+            connection=conn_spec, 
+            graph_name="coco_docs_graph", # Redundant if specified in connection but good for clarity if model supports overrides
+            mapping=cocoindex.targets.Nodes(label="Document")
+        ),
+        primary_key_fields=["filename"],
+    )
+    
+    # Declare reference Node to reference entity node in a relationship
+    flow_builder.declare(
+        GraphDbDeclaration(
+            connection=conn_spec,
+            graph_name="coco_docs_graph",
+            nodes_label="Entity",
+            primary_key_fields=["value"],
+        )
+    )
+    
+    entity_relationship.export(
+        "entity_relationship",
+        GraphDbSpec(
+            connection=conn_spec,
+            graph_name="coco_docs_graph",
+            mapping=cocoindex.targets.Relationships(
+                rel_type="RELATIONSHIP",
+                source=cocoindex.targets.NodeFromFields(
+                    label="Entity",
+                    fields=[
+                        cocoindex.targets.TargetFieldMapping(
+                            source="subject", target="value"
+                        ),
+                    ],
+                ),
+                target=cocoindex.targets.NodeFromFields(
+                    label="Entity",
+                    fields=[
+                        cocoindex.targets.TargetFieldMapping(
+                            source="object", target="value"
+                        ),
+                    ],
+                ),
+            ),
+        ),
+        primary_key_fields=["id"],
+    )
+    
+    entity_mention.export(
+        "entity_mention",
+        GraphDbSpec(
+            connection=conn_spec,
+            graph_name="coco_docs_graph",
+            mapping=cocoindex.targets.Relationships(
+                rel_type="MENTION",
+                source=cocoindex.targets.NodeFromFields(
+                    label="Document",
+                    fields=[cocoindex.targets.TargetFieldMapping("filename")],
+                ),
+                target=cocoindex.targets.NodeFromFields(
+                    label="Entity",
+                    fields=[
+                        cocoindex.targets.TargetFieldMapping(
+                            source="entity", target="value"
+                        )
+                    ],
+                ),
+            ),
+        ),
+        primary_key_fields=["id"],
+    )
