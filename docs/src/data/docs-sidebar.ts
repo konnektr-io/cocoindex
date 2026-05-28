@@ -58,6 +58,7 @@ export const sidebar: SidebarItem[] = [
     type: 'category',
     label: 'Connectors',
     items: [
+      { type: 'doc', slug: 'connectors/age', label: 'Apache AGE' },
       { type: 'doc', slug: 'connectors/amazon_s3', label: 'Amazon S3' },
       { type: 'doc', slug: 'connectors/doris', label: 'Apache Doris' },
       { type: 'doc', slug: 'connectors/falkordb', label: 'FalkorDB' },

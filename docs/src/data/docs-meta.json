@@ -49,6 +49,10 @@
       "sourcePath": "common_resources/vector_schema.md",
       "reviewedTs": 1777723200
     },
+    "connectors/age": {
+      "sourcePath": "connectors/age.md",
+      "reviewedTs": 1777723200
+    },
     "connectors/amazon_s3": {
       "sourcePath": "connectors/amazon_s3.md",
       "reviewedTs": 1777723200
