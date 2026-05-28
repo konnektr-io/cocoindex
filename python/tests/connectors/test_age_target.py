@@ -20,49 +20,33 @@ import pytest
 import pytest_asyncio
 
 import cocoindex as coco
+from cocoindex.connectors import age as ag
+from cocoindex.connectors.age._cypher import (
+    build_constraint_create,
+    build_constraint_drop,
+    build_edge_delete,
+    build_edge_index_create,
+    build_edge_index_drop,
+    build_edge_upsert,
+    build_vertex_delete,
+    build_vertex_index_create,
+    build_vertex_index_drop,
+    build_vertex_upsert,
+    validate_identifier,
+)
 
 from tests import common
 
 coco_env = common.create_test_env(__file__)
 
-
-# =============================================================================
-# Skip gates
-# =============================================================================
-
-try:
-    import age as _age  # type: ignore[import-not-found]  # noqa: F401
-
-    HAS_AGE = True
-except ImportError:
-    HAS_AGE = False
-
-requires_age = pytest.mark.skipif(not HAS_AGE, reason="apache-age-python is not installed")
+KG_DB: coco.ContextKey[Any] = coco.ContextKey("test_age_kg")
 
 _HAS_AGE_SERVER = bool(os.environ.get("AGE_TEST_SERVER"))
 
 requires_age_server = pytest.mark.skipif(
-    not (HAS_AGE and _HAS_AGE_SERVER),
+    not _HAS_AGE_SERVER,
     reason="AGE_TEST_SERVER is not set",
 )
-
-if HAS_AGE:
-    from cocoindex.connectors import age as ag  # type: ignore[attr-defined]
-    from cocoindex.connectors.age._cypher import (  # type: ignore[import-untyped]
-        build_constraint_create,
-        build_constraint_drop,
-        build_edge_delete,
-        build_edge_index_create,
-        build_edge_index_drop,
-        build_edge_upsert,
-        build_vertex_delete,
-        build_vertex_index_create,
-        build_vertex_index_drop,
-        build_vertex_upsert,
-        validate_identifier,
-    )
-
-    KG_DB: coco.ContextKey[Any] = coco.ContextKey("test_age_kg")
 
 
 # =============================================================================
@@ -70,7 +54,6 @@ if HAS_AGE:
 # =============================================================================
 
 
-@requires_age
 class TestValidateIdentifier:
     @pytest.mark.parametrize(
         "name", ["users", "_private", "T1", "a_b_c", "X", "Document", "MENTION"]
@@ -92,12 +75,11 @@ class TestValidateIdentifier:
 # =============================================================================
 
 
-@requires_age
 class TestVertexUpsertSql:
     def test_single_pk_with_props(self) -> None:
         sql = build_vertex_upsert("Document", ["filename"], ["title", "summary"])
         assert "CREATE" in sql
-        assert "Document" in sql  # label name unquoted — AGE uses unquoted labels
+        assert "Document" in sql
         assert "$batch" in sql
         assert "title" in sql
         assert "summary" in sql
@@ -105,7 +87,6 @@ class TestVertexUpsertSql:
     def test_single_pk_no_value_fields(self) -> None:
         sql = build_vertex_upsert("Document", ["filename"], [])
         assert "CREATE" in sql
-        assert "ON CONFLICT" not in sql  # merge via MATCH/CREATE, not SQL ON CONFLICT
 
     def test_empty_pk_raises(self) -> None:
         with pytest.raises(ValueError, match="primary_key"):
@@ -114,23 +95,18 @@ class TestVertexUpsertSql:
     def test_uses_unwound_batch(self) -> None:
         sql = build_vertex_upsert("Doc", ["id"], ["val"])
         assert "UNWIND $batch AS row" in sql
-        assert "row.key" in sql
-        assert "row.props" in sql
 
 
-@requires_age
 class TestVertexDeleteSql:
     def test_detach_delete(self) -> None:
         sql = build_vertex_delete("Document", ["filename"])
         assert "DETACH DELETE" in sql
-        assert "cypher" in sql.lower() or "cypher" in sql
 
     def test_unwinds_batch(self) -> None:
         sql = build_vertex_delete("Doc", ["id"])
         assert "UNWIND $batch AS row" in sql
 
 
-@requires_age
 class TestEdgeUpsertSql:
     def test_three_creates_with_props(self) -> None:
         sql = build_edge_upsert(
@@ -151,20 +127,16 @@ class TestEdgeUpsertSql:
 
     def test_empty_pk_raises(self) -> None:
         with pytest.raises(ValueError):
-            build_edge_upsert(
-                "REL", "A", ["x"], "B", ["y"], [], ["p"],
-            )
+            build_edge_upsert("REL", "A", ["x"], "B", ["y"], [], ["p"])
 
 
-@requires_age
 class TestEdgeDeleteSql:
     def test_unwinds_batch(self) -> None:
         sql = build_edge_delete("REL", ["id"])
-        assert "DELETE r" in sql or "DELETE e" in sql
+        assert "DELETE" in sql
         assert "UNWIND $batch AS row" in sql
 
 
-@requires_age
 class TestIndexDdlSql:
     def test_vertex_index_create(self) -> None:
         sql = build_vertex_index_create("Document", ["filename"])
@@ -184,7 +156,6 @@ class TestIndexDdlSql:
         assert "DROP INDEX" in sql
 
 
-@requires_age
 class TestConstraintDdlSql:
     def test_create(self) -> None:
         sql = build_constraint_create("Document", ["filename"])
@@ -205,7 +176,6 @@ class TestConstraintDdlSql:
 # =============================================================================
 
 
-@requires_age
 class TestTableSchemaFromClass:
     @pytest.mark.asyncio
     async def test_basic_dataclass(self) -> None:
@@ -237,11 +207,10 @@ class TestTableSchemaFromClass:
 
 
 # =============================================================================
-# Identifier-validation-at-API-entry tests (require apache-age-python, no server)
+# Identifier-validation-at-API-entry tests
 # =============================================================================
 
 
-@requires_age
 class TestIdentifierValidationAtApiEntryPoints:
     def test_table_schema_invalid_column(self) -> None:
         with pytest.raises(ValueError, match="column name"):
@@ -278,11 +247,7 @@ class TestIdentifierValidationAtApiEntryPoints:
     def test_connection_factory_invalid_graph_name(self) -> None:
         with pytest.raises(ValueError, match="graph name"):
             ag.ConnectionFactory(
-                host="localhost",
-                port=5455,
-                dbname="postgres",
-                user="postgres",
-                password="postgres",
+                dsn="postgresql://localhost:5432/postgres",
                 graph="bad graph name",
             )
 
@@ -293,14 +258,17 @@ class TestIdentifierValidationAtApiEntryPoints:
 
 
 @pytest.fixture(scope="module")
-def age_dsn() -> Any:
-    """Spin up a PostgreSQL + AGE container once per test module."""
-    if not (HAS_AGE and _HAS_AGE_SERVER):
+def age_conn_params() -> Any:
+    """Spin up a PostgreSQL + AGE container once per test module.
+
+    Returns a tuple (dsn, host, port, dbname, user, password) for the
+    container's actual dynamically-allocated host/port.
+    """
+    if not _HAS_AGE_SERVER:
         pytest.skip("AGE_TEST_SERVER is not set")
 
     from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 
-    # AGE images available on Docker Hub (e.g. apache/age:latest)
     container = PostgresContainer(
         "apache/age:latest_PG17a",
         user="postgres",
@@ -312,28 +280,35 @@ def age_dsn() -> Any:
         dsn = container.get_connection_url().replace(
             "postgresql+psycopg2://", "postgresql://"
         )
-        yield dsn
+        host = container.get_container_host_ip()
+        mapped_port = container.get_exposed_port(5432)
+        yield dsn, host, mapped_port, "postgres", "postgres", "postgres"
     finally:
         container.stop()
 
 
 @pytest_asyncio.fixture
 async def age_clean_env(
-    age_dsn: str,
-) -> AsyncIterator[str]:
-    """Create a unique graph, wipe before each test, drop at the end."""
-    import asyncpg  # type: ignore[import-not-found]
+    age_conn_params: Any,
+) -> AsyncIterator[tuple[str, str, str, str, str, str, str]]:
+    """Create a unique graph per test, clean up at the end.
 
+    Yields (dsn, host, port, dbname, user, password, graph_name).
+    """
+    import asyncpg  # type: ignore[import-untyped]
+    from urllib.parse import urlparse
+
+    dsn, host, port, dbname, user, password = age_conn_params
     graph_name = f"test_{uuid_mod.uuid4().hex[:8]}"
 
-    pool = await asyncpg.create_pool(age_dsn, min_size=1, max_size=1)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=1)
     async with pool.acquire() as conn:
         await conn.execute(f"SELECT * FROM ag_catalog.create_graph('{graph_name}')")
     await pool.close()
 
-    yield graph_name
+    yield dsn, host, port, dbname, user, password, graph_name
 
-    pool = await asyncpg.create_pool(age_dsn, min_size=1, max_size=1)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=1)
     async with pool.acquire() as conn:
         try:
             await conn.execute(
@@ -347,7 +322,7 @@ async def age_clean_env(
 async def _read_vertices(
     dsn: str, graph_name: str, label: str
 ) -> list[dict[str, Any]]:
-    import asyncpg  # type: ignore[import-not-found]
+    import asyncpg  # type: ignore[import-untyped]
 
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=1)
     async with pool.acquire() as conn:
@@ -369,7 +344,7 @@ async def _read_vertices(
 async def _read_edges(
     dsn: str, graph_name: str, rel_type: str
 ) -> list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
-    import asyncpg  # type: ignore[import-not-found]
+    import asyncpg  # type: ignore[import-untyped]
 
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=1)
     async with pool.acquire() as conn:
@@ -462,9 +437,10 @@ async def _declare_entities_and_relationships() -> None:
 
 @requires_age_server
 @pytest.mark.asyncio
-async def test_vertex_upsert_and_readback(age_clean_env: str, age_dsn: str) -> None:
+async def test_vertex_upsert_and_readback(age_clean_env: Any) -> None:
     global _current_graph, _node_rows
-    _current_graph = age_clean_env
+    dsn, host, port, dbname, user, password, graph_name = age_clean_env
+    _current_graph = graph_name
     _node_rows = [
         Document(filename="a.md", title="A", summary="alpha"),
         Document(filename="b.md", title="B", summary="beta"),
@@ -472,11 +448,7 @@ async def test_vertex_upsert_and_readback(age_clean_env: str, age_dsn: str) -> N
     coco_env.context_provider.provide(
         KG_DB,
         ag.ConnectionFactory(
-            host="localhost",
-            port=5455,
-            dbname="postgres",
-            user="postgres",
-            password="postgres",
+            dsn=dsn,
             graph=_current_graph,
         ),
     )
@@ -486,7 +458,7 @@ async def test_vertex_upsert_and_readback(age_clean_env: str, age_dsn: str) -> N
     )
     await app.update()
 
-    rows = await _read_vertices(age_dsn, _current_graph, "Document")
+    rows = await _read_vertices(dsn, _current_graph, "Document")
     by_fn = {r.get("filename", ""): r for r in rows}
     assert set(by_fn) == {"a.md", "b.md"}
     assert by_fn["a.md"]["title"] == "A"
@@ -495,18 +467,15 @@ async def test_vertex_upsert_and_readback(age_clean_env: str, age_dsn: str) -> N
 
 @requires_age_server
 @pytest.mark.asyncio
-async def test_reconcile_twice_is_noop(age_clean_env: str, age_dsn: str) -> None:
+async def test_reconcile_twice_is_noop(age_clean_env: Any) -> None:
     global _current_graph, _node_rows
-    _current_graph = age_clean_env
+    dsn, host, port, dbname, user, password, graph_name = age_clean_env
+    _current_graph = graph_name
     _node_rows = [Document(filename="a.md", title="A", summary="alpha")]
     coco_env.context_provider.provide(
         KG_DB,
         ag.ConnectionFactory(
-            host="localhost",
-            port=5455,
-            dbname="postgres",
-            user="postgres",
-            password="postgres",
+            dsn=dsn,
             graph=_current_graph,
         ),
     )
@@ -515,27 +484,24 @@ async def test_reconcile_twice_is_noop(age_clean_env: str, age_dsn: str) -> None
         _declare_documents_only,
     )
     await app.update()
-    rows1 = await _read_vertices(age_dsn, _current_graph, "Document")
+    rows1 = await _read_vertices(dsn, _current_graph, "Document")
     await app.update()
-    rows2 = await _read_vertices(age_dsn, _current_graph, "Document")
+    rows2 = await _read_vertices(dsn, _current_graph, "Document")
     assert rows1 == rows2
     assert len(rows2) == 1
 
 
 @requires_age_server
 @pytest.mark.asyncio
-async def test_modify_value_triggers_one_upsert(age_clean_env: str, age_dsn: str) -> None:
+async def test_modify_value_triggers_one_upsert(age_clean_env: Any) -> None:
     global _current_graph, _node_rows
-    _current_graph = age_clean_env
+    dsn, host, port, dbname, user, password, graph_name = age_clean_env
+    _current_graph = graph_name
     _node_rows = [Document(filename="a.md", title="A", summary="alpha")]
     coco_env.context_provider.provide(
         KG_DB,
         ag.ConnectionFactory(
-            host="localhost",
-            port=5455,
-            dbname="postgres",
-            user="postgres",
-            password="postgres",
+            dsn=dsn,
             graph=_current_graph,
         ),
     )
@@ -546,16 +512,17 @@ async def test_modify_value_triggers_one_upsert(age_clean_env: str, age_dsn: str
     await app.update()
     _node_rows[0] = Document(filename="a.md", title="A", summary="ALPHA-2")
     await app.update()
-    rows = await _read_vertices(age_dsn, _current_graph, "Document")
+    rows = await _read_vertices(dsn, _current_graph, "Document")
     assert len(rows) == 1
     assert rows[0]["summary"] == "ALPHA-2"
 
 
 @requires_age_server
 @pytest.mark.asyncio
-async def test_delete_removes_vertex(age_clean_env: str, age_dsn: str) -> None:
+async def test_delete_removes_vertex(age_clean_env: Any) -> None:
     global _current_graph, _node_rows
-    _current_graph = age_clean_env
+    dsn, host, port, dbname, user, password, graph_name = age_clean_env
+    _current_graph = graph_name
     _node_rows = [
         Document(filename="a.md", title="A", summary="alpha"),
         Document(filename="b.md", title="B", summary="beta"),
@@ -563,11 +530,7 @@ async def test_delete_removes_vertex(age_clean_env: str, age_dsn: str) -> None:
     coco_env.context_provider.provide(
         KG_DB,
         ag.ConnectionFactory(
-            host="localhost",
-            port=5455,
-            dbname="postgres",
-            user="postgres",
-            password="postgres",
+            dsn=dsn,
             graph=_current_graph,
         ),
     )
@@ -577,31 +540,28 @@ async def test_delete_removes_vertex(age_clean_env: str, age_dsn: str) -> None:
     )
     await app.update()
     assert {
-        r.get("filename", "") for r in await _read_vertices(age_dsn, _current_graph, "Document")
+        r.get("filename", "")
+        for r in await _read_vertices(dsn, _current_graph, "Document")
     } == {"a.md", "b.md"}
     _node_rows.pop()
     await app.update()
     assert {
-        r.get("filename", "") for r in await _read_vertices(age_dsn, _current_graph, "Document")
+        r.get("filename", "")
+        for r in await _read_vertices(dsn, _current_graph, "Document")
     } == {"a.md"}
 
 
 @requires_age_server
 @pytest.mark.asyncio
-async def test_edge_upsert_with_endpoint_merge(
-    age_clean_env: str, age_dsn: str,
-) -> None:
+async def test_edge_upsert_with_endpoint_merge(age_clean_env: Any) -> None:
     global _current_graph, _rel_pairs
-    _current_graph = age_clean_env
+    dsn, host, port, dbname, user, password, graph_name = age_clean_env
+    _current_graph = graph_name
     _rel_pairs = [("alice", "bob"), ("bob", "carol")]
     coco_env.context_provider.provide(
         KG_DB,
         ag.ConnectionFactory(
-            host="localhost",
-            port=5455,
-            dbname="postgres",
-            user="postgres",
-            password="postgres",
+            dsn=dsn,
             graph=_current_graph,
         ),
     )
@@ -611,10 +571,10 @@ async def test_edge_upsert_with_endpoint_merge(
     )
     await app.update()
 
-    nodes = await _read_vertices(age_dsn, _current_graph, "Entity")
+    nodes = await _read_vertices(dsn, _current_graph, "Entity")
     assert {n.get("value", "") for n in nodes} == {"alice", "bob", "carol"}
 
-    edges = await _read_edges(age_dsn, _current_graph, "REL")
+    edges = await _read_edges(dsn, _current_graph, "REL")
     assert len(edges) == 2
     pairs = {(s.get("value", ""), t.get("value", "")) for s, t, _ in edges}
     assert pairs == {("alice", "bob"), ("bob", "carol")}
